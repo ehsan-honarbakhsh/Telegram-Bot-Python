@@ -5,19 +5,80 @@ import requests
 import os
 import time
 import logging
+import asyncio
 from bs4 import BeautifulSoup
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from gtts import gTTS
 
-# Setup logging
+# Setup logging before any logger usage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import transformers and numpy after logger setup
+try:
+    from transformers import pipeline
+    import numpy
+    TRANSFORMERS_AVAILABLE = True
+    logger.info(f"NumPy version: {numpy.__version__}, Path: {numpy.__file__}")
+except ImportError as e:
+    TRANSFORMERS_AVAILABLE = False
+    pipeline = None
+    numpy = None
+    logger.error(f"Failed to import transformers or numpy: {str(e)}")
+
+# Import googletrans after logger setup
+try:
+    from googletrans import Translator, LANGUAGES
+    GOOGLETRANS_AVAILABLE = True
+    logger.info("Googletrans imported successfully")
+except ImportError as e:
+    GOOGLETRANS_AVAILABLE = False
+    Translator = None
+    LANGUAGES = {}
+    logger.error(f"Failed to import googletrans: {str(e)}")
 
 # Initialize the Telegram bot using environment variable
 API_TOKEN = os.environ.get("API_TOKEN")
 if not API_TOKEN:
     raise ValueError("API_TOKEN environment variable not set")
 bot = telebot.TeleBot(API_TOKEN)
+
+# Initialize GPT-2 pipeline (loaded once to save memory)
+gpt2_generator = None
+if TRANSFORMERS_AVAILABLE:
+    try:
+        gpt2_generator = pipeline("text-generation", model="gpt2", tokenizer="gpt2")
+        logger.info("GPT-2 model loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to load GPT-2 model: {str(e)}")
+        gpt2_generator = None
+else:
+    logger.error("Transformers or numpy not available. GPT-2 feature disabled.")
+
+# Initialize Google Translate
+translator = None
+if GOOGLETRANS_AVAILABLE:
+    try:
+        translator = Translator()
+        logger.info("Google Translate initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Google Translate: {str(e)}")
+        translator = None
+else:
+    logger.error("Googletrans not available. Translation feature disabled.")
+
+# Initialize a single event loop for async translations
+loop = None
+if GOOGLETRANS_AVAILABLE:
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        logger.info("Event loop initialized for async translations")
+    except Exception as e:
+        logger.error(f"Failed to initialize event loop: {str(e)}")
+        loop = None
 
 # State management to track user mode
 user_states = {}
@@ -27,14 +88,22 @@ def get_keyboard():
     markup = ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="Choose a Service")
     markup.add(KeyboardButton('Convert Text to Sound'))
     markup.add(KeyboardButton('Cambridge Dictionary'))
+    if gpt2_generator:
+        markup.add(KeyboardButton('Ask a Question'))
+    if translator:
+        markup.add(KeyboardButton('Translate to Persian'))
+        markup.add(KeyboardButton('Translate to English'))
     return markup
 
 def clean_ansi_codes(text):
-    """Remove all ANSI escape codes from the text."""
+    """Remove ANSI escape codes while preserving spaces and punctuation."""
     ansi_regex = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     cleaned = ansi_regex.sub('', text)
-    logger.info(f"Before ANSI cleaning:\n{text}")
-    logger.info(f"After ANSI cleaning:\n{cleaned}")
+    # Preserve single spaces and line breaks, avoid collapsing multiple spaces
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    cleaned = re.sub(r'\n+', '\n', cleaned).strip()
+    logger.info(f"Raw text before ANSI cleaning:\n{repr(text)}")
+    logger.info(f"Text after ANSI cleaning:\n{repr(cleaned)}")
     return cleaned
 
 def parse_cambridge_output(raw_output):
@@ -43,42 +112,60 @@ def parse_cambridge_output(raw_output):
     result = {
         "definitions": []
     }
-    
+    seen_definitions = set()  # Track unique definitions to avoid duplicates
     current_definition = None
+    
     for line in lines:
         line = line.strip()
         if not line:
             continue
         
-        logger.info(f"Parsing line: {line}")
+        logger.info(f"Parsing line: {repr(line)}")
         
-        # Extract definitions
-        if line.startswith(':') or (':' in line and '|' not in line and not line.startswith('uk') and not line.startswith('us')):
+        # Extract definitions (require meaningful content)
+        if (line.startswith(':') or (':' in line and '|' not in line and not line.startswith('uk') and not line.startswith('us'))):
             meaning = line.split(':', 1)[-1].strip()
-            meaning = re.sub(r'\s*\[.*?\]\s*$', '', meaning).strip()  # Remove [informal], etc.
-            if meaning and not meaning.startswith('('):
-                current_definition = {"meaning": meaning, "examples": []}
-                result["definitions"].append(current_definition)
-                logger.info(f"Added definition: {meaning}")
+            meaning = re.sub(r'\s*\[.*?\]\s*$', '', meaning).strip()
+            # Ensure definition is meaningful (at least 5 characters and contains a space or punctuation)
+            if (meaning and len(meaning) >= 5 and (' ' in meaning or any(c in meaning for c in '.!?:')) and not meaning.startswith('(')):
+                normalized_meaning = re.sub(r'\s+', ' ', meaning.lower()).strip()
+                if normalized_meaning not in seen_definitions:
+                    current_definition = {"meaning": meaning, "examples": []}
+                    result["definitions"].append(current_definition)
+                    seen_definitions.add(normalized_meaning)
+                    logger.info(f"Added definition: {meaning}")
+                else:
+                    logger.info(f"Skipped duplicate definition: {meaning}")
+            else:
+                logger.info(f"Skipped invalid definition: {meaning}")
         
         # Extract examples
         if line.startswith('|') and current_definition is not None:
             example = line.split('|')[-1].strip()
-            if example and not example.startswith('['):
+            example = re.sub(r'\s+', ' ', example).strip()
+            if example and not example.startswith('[') and len(example) >= 5:
                 current_definition["examples"].append(example)
                 logger.info(f"Added example: {example}")
+            else:
+                logger.info(f"Skipped invalid example: {example}")
 
     return result
 
 def escape_markdown_v2(text):
-    """Escape special characters for Telegram MarkdownV2."""
+    """Escape special characters for Telegram MarkdownV2, preserving spaces."""
+    if not text:
+        return text
     special_chars = r'_*[]()~`>#+-=|{}.!'
-    for char in special_chars:
-        text = text.replace(char, f'\\{char}')
-    return text
+    escaped = ''
+    for char in text:
+        if char in special_chars:
+            escaped += '\\' + char
+        else:
+            escaped += char
+    return escaped
 
 def format_for_telegram(data, word, use_html=False):
-    """Format the parsed data as a Telegram-friendly message with only definitions and examples."""
+    """Format the parsed data as a Telegram-friendly message with proper spacing."""
     if not data["definitions"]:
         return f"No definitions found for '{word}'."
     
@@ -92,7 +179,8 @@ def format_for_telegram(data, word, use_html=False):
     else:
         output = []
         for i, defn in enumerate(data["definitions"], 1):
-            output.append(f"{i}\\. {escape_markdown_v2(defn['meaning'])}")
+            meaning = escape_markdown_v2(defn['meaning'])
+            output.append(f"{i}\\. {meaning}")
             for example in defn["examples"]:
                 output.append(f"   \\- {escape_markdown_v2(example)}")
         return "\n".join(output)
@@ -107,11 +195,23 @@ def lookup_word_fallback(word):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         data = {"definitions": []}
+        seen_definitions = set()
         for def_block in soup.select(".def-block"):
-            meaning = def_block.select_one(".def.ddef_d").get_text(strip=True) if def_block.select_one(".def.ddef_d") else ""
-            examples = [ex.get_text(strip=True) for ex in def_block.select(".examp.dexamp") if ex.get_text(strip=True)]
-            if meaning:
+            meaning_elem = def_block.select_one(".def.ddef_d")
+            meaning = meaning_elem.get_text(strip=True) if meaning_elem else ""
+            meaning = re.sub(r'\s+', ' ', meaning).strip()
+            normalized_meaning = meaning.lower()
+            examples = [
+                re.sub(r'\s+', ' ', ex.get_text(strip=True)).strip()
+                for ex in def_block.select(".examp.dexamp")
+                if ex.get_text(strip=True) and len(ex.get_text(strip=True)) >= 5
+            ]
+            if meaning and len(meaning) >= 5 and normalized_meaning not in seen_definitions:
                 data["definitions"].append({"meaning": meaning, "examples": examples})
+                seen_definitions.add(normalized_meaning)
+                logger.info(f"Web scraped definition: {meaning}")
+            else:
+                logger.info(f"Skipped invalid or duplicate web definition: {meaning}")
         logger.info(f"Web scraped data for '{word}':\n{data}")
         return format_for_telegram(data, word, use_html=False) if data["definitions"] else f"No definitions found for '{word}' (web fallback)."
     except requests.RequestException as e:
@@ -139,7 +239,7 @@ def lookup_word(word):
             check=True
         )
         clean_output = clean_ansi_codes(result.stdout)
-        logger.info(f"Raw camb output for '{word}':\n{clean_output}")
+        logger.info(f"Raw camb output for '{word}':\n{repr(clean_output)}")
         if not clean_output.strip():
             logger.error(f"Empty output from camb for '{word}'")
             return lookup_word_fallback(word)
@@ -159,19 +259,138 @@ def lookup_word(word):
         logger.error(error_msg)
         return lookup_word_fallback(word)
 
+def generate_gpt2_response(question):
+    """Generate a response to a question using GPT-2."""
+    if not gpt2_generator:
+        return "Error: GPT-2 feature is unavailable due to missing dependencies (e.g., numpy or transformers). Please contact the bot administrator."
+    
+    try:
+        # Ensure the question ends with a question mark for better context
+        prompt = question.strip()
+        if not prompt.endswith('?'):
+            prompt += '?'
+        # Generate response with explicit truncation
+        response = gpt2_generator(
+            prompt,
+            max_length=100,
+            num_return_sequences=1,
+            temperature=0.6,
+            top_p=0.9,
+            do_sample=True,
+            truncation=True
+        )[0]['generated_text']
+        # Clean up response (remove prompt and extra whitespace)
+        response = response.replace(prompt, '').strip()
+        if not response:
+            response = "Sorry, I couldn't generate a meaningful answer."
+        logger.info(f"GPT-2 response for '{question}': {response}")
+        return response
+    except Exception as e:
+        error_msg = f"Error generating GPT-2 response: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+async def async_translate(text, src_lang, dest_lang):
+    """Helper function to perform asynchronous translation."""
+    try:
+        translation = await translator.translate(text, src=src_lang, dest=dest_lang)
+        return translation
+    except Exception as e:
+        raise Exception(f"Async translation failed: {str(e)}")
+
+def translate_to_persian(text):
+    """Translate text from English to Persian using Google Translate."""
+    if not translator:
+        return "Error: Google Translate feature is unavailable due to missing dependencies (e.g., googletrans)."
+    
+    if not text.strip():
+        return "Error: No text provided for translation."
+    
+    if not loop:
+        return "Error: Event loop unavailable for async translation."
+    
+    try:
+        # Validate language codes
+        src_lang = 'en'
+        dest_lang = 'fa'
+        if src_lang not in LANGUAGES or dest_lang not in LANGUAGES:
+            return "Error: English ('en') or Persian ('fa') not supported by Google Translate."
+        # Perform translation using the event loop
+        translation = loop.run_until_complete(async_translate(text, src_lang, dest_lang))
+        result = (
+            f"English: {text}\n"
+            f"Persian: {translation.text}"
+        )
+        logger.info(f"Translated '{text}' from English to Persian: {translation.text}")
+        return result
+    except Exception as e:
+        error_msg = f"Error translating text to Persian: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
+def translate_to_english(text):
+    """Translate text from Persian to English using Google Translate."""
+    if not translator:
+        return "Error: Google Translate feature is unavailable due to missing dependencies (e.g., googletrans)."
+    
+    if not text.strip():
+        return "Error: No text provided for translation."
+    
+    if not loop:
+        return "Error: Event loop unavailable for async translation."
+    
+    try:
+        # Validate language codes
+        src_lang = 'fa'
+        dest_lang = 'en'
+        if src_lang not in LANGUAGES or dest_lang not in LANGUAGES:
+            return "Error: Persian ('fa') or English ('en') not supported by Google Translate."
+        # Perform translation using the event loop
+        translation = loop.run_until_complete(async_translate(text, src_lang, dest_lang))
+        result = (
+            f"Persian: {text}\n"
+            f"English: {translation.text}"
+        )
+        logger.info(f"Translated '{text}' from Persian to English: {translation.text}")
+        return result
+    except Exception as e:
+        error_msg = f"Error translating text to English: {str(e)}"
+        logger.error(error_msg)
+        return error_msg
+
 def send_long_message(bot, chat_id, reply_to_message_id, text, parse_mode):
     """Split and send long messages to avoid Telegram's character limit."""
     if not text:
-        text = "No definitions found."
+        text = "No response available."
+    if parse_mode == "MarkdownV2":
+        text = escape_markdown_v2(text)
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
     for chunk in chunks:
-        bot.send_message(
-            chat_id=chat_id,
-            reply_to_message_id=reply_to_message_id,
-            text=chunk,
-            parse_mode=parse_mode,
-            reply_markup=get_keyboard()
-        )
+        try:
+            bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=reply_to_message_id,
+                text=chunk,
+                parse_mode=parse_mode,
+                reply_markup=get_keyboard()
+            )
+        except Exception as e:
+            logger.error(f"Failed to send message with {parse_mode}: {str(e)}")
+            if parse_mode == "MarkdownV2":
+                bot.send_message(
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                    reply_markup=get_keyboard()
+                )
+            else:
+                bot.send_message(
+                    chat_id=chat_id,
+                    reply_to_message_id=reply_to_message_id,
+                    text=chunk,
+                    reply_markup=get_keyboard()
+                )
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
@@ -179,7 +398,7 @@ def welcome(message):
     user_states[message.chat.id] = None
     bot.send_message(
         message.chat.id,
-        "Hi! Welcome to my Telegram Bot. Choose a service:",
+        "Hi! Welcome to WordWave Bot. Choose a service:",
         reply_markup=get_keyboard()
     )
     logger.info("Welcome message sent")
@@ -205,6 +424,39 @@ def prompt_text_to_speech(message):
         reply_markup=get_keyboard()
     )
     logger.info(f"User {message.chat.id} selected text-to-speech mode")
+
+@bot.message_handler(func=lambda message: message.text == "Ask a Question")
+def prompt_gpt2(message):
+    """Prompt the user to enter a question for GPT-2."""
+    user_states[message.chat.id] = "gpt2"
+    bot.send_message(
+        message.chat.id,
+        "Please ask a question, and I'll answer using GPT-2!",
+        reply_markup=get_keyboard()
+    )
+    logger.info(f"User {message.chat.id} selected GPT-2 question mode")
+
+@bot.message_handler(func=lambda message: message.text == "Translate to Persian")
+def prompt_translate_to_persian(message):
+    """Prompt the user to enter English text for translation to Persian."""
+    user_states[message.chat.id] = "translate_to_persian"
+    bot.send_message(
+        message.chat.id,
+        "Please enter English text to translate to Persian.",
+        reply_markup=get_keyboard()
+    )
+    logger.info(f"User {message.chat.id} selected translate to Persian mode")
+
+@bot.message_handler(func=lambda message: message.text == "Translate to English")
+def prompt_translate_to_english(message):
+    """Prompt the user to enter Persian text for translation to English."""
+    user_states[message.chat.id] = "translate_to_english"
+    bot.send_message(
+        message.chat.id,
+        "Please enter Persian text to translate to English.",
+        reply_markup=get_keyboard()
+    )
+    logger.info(f"User {message.chat.id} selected translate to English mode")
 
 @bot.message_handler(func=lambda message: True)
 def handle_input(message):
@@ -267,6 +519,12 @@ def handle_input(message):
             output = gTTS(text=text, lang="en", tld='com.au')
             output.save(file_name)
             with open(file_name, "rb") as voice_file:
+                bot.send_message(
+                    chat_id=chat_id,
+                    reply_to_message_id=message.id,
+                    text="Generating voice...",
+                    reply_markup=get_keyboard()
+                )
                 bot.send_voice(
                     chat_id=chat_id,
                     reply_to_message_id=message.id,
@@ -285,5 +543,49 @@ def handle_input(message):
                 reply_markup=get_keyboard()
             )
 
+    elif state == "gpt2":
+        if not text:
+            bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message.id,
+                text="Please ask a question.",
+                reply_markup=get_keyboard()
+            )
+            return
+        response = generate_gpt2_response(text)
+        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
 
-bot.infinity_polling(none_stop=True)
+    elif state == "translate_to_persian":
+        if not text:
+            bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message.id,
+                text="Please provide English text to translate to Persian.",
+                reply_markup=get_keyboard()
+            )
+            return
+        response = translate_to_persian(text)
+        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
+
+    elif state == "translate_to_english":
+        if not text:
+            bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message.id,
+                text="Please provide Persian text to translate to English.",
+                reply_markup=get_keyboard()
+            )
+            return
+        response = translate_to_english(text)
+        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
+
+# Start the bot
+if __name__ == "__main__":
+    logger.info("Bot is running...")
+    try:
+        bot.infinity_polling(none_stop=True)
+    finally:
+        # Clean up: close the event loop if it exists
+        if loop and not loop.is_closed():
+            loop.close()
+            logger.info("Event loop closed")
