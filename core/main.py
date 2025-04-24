@@ -8,17 +8,17 @@ import logging
 import asyncio
 import json
 import threading
-import html  # Added for HTML entity decoding
+import html
 from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from gtts import gTTS
 
-# Setup logging before any logger usage
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+# Import transformers and numpy
 try:
     from transformers import pipeline
     import numpy
@@ -30,6 +30,7 @@ except ImportError as e:
     numpy = None
     logger.error(f"Failed to import transformers or numpy: {str(e)}")
 
+# Import googletrans
 try:
     from googletrans import Translator, LANGUAGES
     GOOGLETRANS_AVAILABLE = True
@@ -40,13 +41,13 @@ except ImportError as e:
     LANGUAGES = {}
     logger.error(f"Failed to import googletrans: {str(e)}")
 
-# Initialize the Telegram bot using environment variable
+# Initialize Telegram bot
 API_TOKEN = os.environ.get("API_TOKEN")
 if not API_TOKEN:
     raise ValueError("API_TOKEN environment variable not set")
 bot = telebot.TeleBot(API_TOKEN)
 
-# Initialize GPT-2 pipeline (loaded once to save memory)
+# Initialize GPT-2
 gpt2_generator = None
 if TRANSFORMERS_AVAILABLE:
     try:
@@ -70,13 +71,16 @@ if GOOGLETRANS_AVAILABLE:
 else:
     logger.error("Googletrans not available. Translation feature disabled.")
 
-# State management to track user mode
+# Global event loop for main thread
+main_loop = asyncio.get_event_loop()
+if main_loop.is_closed():
+    main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(main_loop)
+logger.info("Main thread event loop initialized")
+
+# State management
 user_states = {}
-
-# Message history to track sent messages for clearing
 message_history = {}
-
-# Task storage
 TASKS_FILE = "tasks.json"
 tasks = {}
 
@@ -104,11 +108,10 @@ def save_tasks():
     except Exception as e:
         logger.error(f"Failed to save tasks: {str(e)}")
 
-# Load tasks on startup
 load_tasks()
 
 def get_main_keyboard():
-    """Create the main reply keyboard with service buttons."""
+    """Create the main reply keyboard."""
     markup = ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="Choose a Service")
     markup.add(KeyboardButton('Convert Text to Speech'))
     markup.add(KeyboardButton('Cambridge Dictionary'))
@@ -116,8 +119,8 @@ def get_main_keyboard():
     if gpt2_generator:
         markup.add(KeyboardButton('Ask a Question(GPT2)'))
     if translator:
-        markup.add(KeyboardButton('Translate to Persian'))
-        markup.add(KeyboardButton('Translate to English'))
+        markup.add(KeyboardButton('Translate to Persian (Google Translate)'))
+        markup.add(KeyboardButton('Translate to English (Google Translate)'))
     markup.add(KeyboardButton('Clear Chat'))
     return markup
 
@@ -131,7 +134,7 @@ def get_todo_keyboard():
     return markup
 
 def clean_ansi_codes(text):
-    """Remove ANSI escape codes while preserving spaces, punctuation, and special characters."""
+    """Remove ANSI escape codes."""
     ansi_regex = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     cleaned = ansi_regex.sub('', text)
     cleaned = cleaned.replace('\t', ' ').replace('\r', '')
@@ -142,11 +145,9 @@ def clean_ansi_codes(text):
     return cleaned
 
 def parse_cambridge_output(raw_output):
-    """Parse the raw Cambridge CLI output to extract definitions and examples, grouped by part of speech."""
+    """Parse Cambridge CLI output."""
     lines = raw_output.splitlines()
-    result = {
-        "definitions": []
-    }
+    result = {"definitions": []}
     seen_definitions = set()
     current_definition = None
     current_pos = None
@@ -155,14 +156,11 @@ def parse_cambridge_output(raw_output):
         line = line.strip()
         if not line:
             continue
-        
         logger.info(f"Parsing line: {repr(line)}")
-        
         if re.match(r'^\s*(verb|noun|adjective|adverb|pronoun|preposition|conjunction|interjection)\s*$', line, re.IGNORECASE):
             current_pos = line.strip().capitalize()
             logger.info(f"Detected part of speech: {current_pos}")
             continue
-        
         if (line.startswith(':') or (':' in line and '|' not in line and not line.startswith('uk') and not line.startswith('us'))):
             meaning = line.split(':', 1)[-1].strip()
             meaning = re.sub(r'\s*\[.*?\]\s*$', '', meaning).strip()
@@ -177,7 +175,6 @@ def parse_cambridge_output(raw_output):
                     logger.info(f"Skipped duplicate definition: {meaning}")
             else:
                 logger.info(f"Skipped invalid definition: {meaning}")
-        
         if line.startswith('|') and current_definition is not None:
             example = line.split('|', 1)[-1].strip()
             example = re.sub(r'\s+', ' ', example).strip()
@@ -194,7 +191,7 @@ def parse_cambridge_output(raw_output):
     return result
 
 def escape_markdown_v2(text):
-    """Escape special characters for Telegram MarkdownV2, including periods."""
+    """Escape special characters for Telegram MarkdownV2."""
     if not text:
         return text
     special_chars = r'_*[]()~`>#+-=|{}.!'
@@ -207,7 +204,7 @@ def escape_markdown_v2(text):
     return escaped
 
 def format_for_telegram(data, word, use_html=False):
-    """Format the parsed data as a Telegram-friendly message with part-of-speech labels."""
+    """Format parsed data for Telegram."""
     if not data["definitions"]:
         return f"No definitions found for '{word}'."
     
@@ -238,8 +235,8 @@ def format_for_telegram(data, word, use_html=False):
         return "\n".join(output).strip()
 
 def lookup_word_fallback(word):
-    """Fallback to web scraping if CLI fails, with improved text extraction."""
-    time.sleep(1)  # Avoid rapid requests
+    """Fallback to web scraping if CLI fails."""
+    time.sleep(1)
     url = f"https://dictionary.cambridge.org/dictionary/english/{word.replace(' ', '-')}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
@@ -249,34 +246,25 @@ def lookup_word_fallback(word):
         data = {"definitions": []}
         seen_definitions = set()
 
-        # Iterate over dictionary entries
         for entry in soup.select(".entry-body__el"):
-            # Get part of speech
             pos_elem = entry.select_one(".pos-header .pos")
             pos = pos_elem.get_text(strip=True).capitalize() if pos_elem else "Unknown"
             logger.info(f"Processing POS: {pos}")
-
-            # Get definitions
             for def_block in entry.select(".def-block"):
-                # Extract meaning
                 meaning_elem = def_block.select_one(".def")
                 if not meaning_elem:
                     logger.info("No meaning found in def-block")
                     continue
                 meaning = meaning_elem.get_text(separator=" ", strip=True)
-                meaning = html.unescape(meaning)  # Decode HTML entities
-                meaning = re.sub(r'\s+', ' ', meaning).strip()  # Normalize whitespace
-                meaning = re.sub(r'[^\w\s.,;?!-]', '', meaning)  # Remove special characters
+                meaning = html.unescape(meaning)
+                meaning = re.sub(r'\s+', ' ', meaning).strip()
+                meaning = re.sub(r'[^\w\s.,;?!-]', '', meaning)
                 normalized_meaning = meaning.lower().strip()
-
-                # Validate meaning
                 if (not meaning or len(meaning) < 10 or ' ' not in meaning or
                         normalized_meaning in seen_definitions or
                         meaning.startswith('(') or meaning.startswith('[')):
                     logger.info(f"Skipped invalid/duplicate meaning: {meaning}")
                     continue
-
-                # Extract examples
                 examples = []
                 for ex_elem in def_block.select(".examp"):
                     example = ex_elem.get_text(separator=" ", strip=True)
@@ -288,8 +276,6 @@ def lookup_word_fallback(word):
                         logger.info(f"Added example: {example}")
                     else:
                         logger.info(f"Skipped invalid example: {example}")
-
-                # Add definition
                 data["definitions"].append({
                     "meaning": meaning,
                     "examples": examples,
@@ -308,7 +294,7 @@ def lookup_word_fallback(word):
         return error_msg
 
 def clear_cambridge_cache(word):
-    """Clear the cambridge CLI cache for a word."""
+    """Clear the cambridge CLI cache."""
     try:
         subprocess.run(['camb', 'l', '-d', word], capture_output=True, text=True, check=True)
         logger.info(f"Cleared cache for '{word}'")
@@ -318,7 +304,6 @@ def clear_cambridge_cache(word):
 def lookup_word(word):
     """Look up a word using the cambridge CLI, with web scraping fallback."""
     clear_cambridge_cache(word)
-    
     try:
         result = subprocess.run(
             ['camb', word],
@@ -348,10 +333,9 @@ def lookup_word(word):
         return lookup_word_fallback(word)
 
 def generate_gpt2_response(question):
-    """Generate a response to a question using GPT-2."""
+    """Generate a response using GPT-2."""
     if not gpt2_generator:
-        return "Error: GPT-2 feature is unavailable due to missing dependencies (e.g., numpy or transformers). Please contact the bot administrator."
-    
+        return "Error: GPT-2 feature is unavailable due to missing dependencies."
     try:
         prompt = question.strip()
         if not prompt.endswith('?'):
@@ -360,7 +344,7 @@ def generate_gpt2_response(question):
             prompt,
             max_length=100,
             num_return_sequences=1,
-            temperature=0.5,
+            temperature=0.6,
             top_p=0.9,
             do_sample=True,
             truncation=True
@@ -381,22 +365,21 @@ async def async_translate(text, src_lang, dest_lang):
         translation = await translator.translate(text, src=src_lang, dest=dest_lang)
         return translation
     except Exception as e:
-        raise Exception(f"Async translation failed: {str(e)}")
+        logger.error(f"Async translation failed: {str(e)}")
+        raise
 
-def translate_to_persian(text):
-    """Translate text from English to Persian using Google Translate."""
+async def translate_to_persian(text):
+    """Translate text from English to Persian."""
     if not translator:
-        return "Error: Google Translate feature is unavailable due to missing dependencies (e.g., googletrans)."
-    
+        return "Error: Google Translate feature is unavailable due to missing dependencies."
     if not text.strip():
         return "Error: No text provided for translation."
-    
     try:
         src_lang = 'en'
         dest_lang = 'fa'
         if src_lang not in LANGUAGES or dest_lang not in LANGUAGES:
-            return "Error: English ('en') or Persian ('fa') not supported by Google Translate."
-        translation = asyncio.run(async_translate(text, src_lang, dest_lang))
+            return "Error: English ('en') or Persian ('fa') not supported."
+        translation = await async_translate(text, src_lang, dest_lang)
         result = (
             f"English: {text}\n"
             f"Persian: {translation.text}"
@@ -408,20 +391,18 @@ def translate_to_persian(text):
         logger.error(error_msg)
         return error_msg
 
-def translate_to_english(text):
-    """Translate text from Persian to English using Google Translate."""
+async def translate_to_english(text):
+    """Translate text from Persian to English."""
     if not translator:
-        return "Error: Google Translate feature is unavailable due to missing dependencies (e.g., googletrans)."
-    
+        return "Error: Google Translate feature is unavailable due to missing dependencies."
     if not text.strip():
         return "Error: No text provided for translation."
-    
     try:
         src_lang = 'fa'
         dest_lang = 'en'
         if src_lang not in LANGUAGES or dest_lang not in LANGUAGES:
-            return "Error: Persian ('fa') or English ('en') not supported by Google Translate."
-        translation = asyncio.run(async_translate(text, src_lang, dest_lang))
+            return "Error: Persian ('fa') or English ('en') not supported."
+        translation = await async_translate(text, src_lang, dest_lang)
         result = (
             f"Persian: {text}\n"
             f"English: {translation.text}"
@@ -434,7 +415,7 @@ def translate_to_english(text):
         return error_msg
 
 def clear_chat(chat_id):
-    """Delete recent bot messages to clear the chat."""
+    """Delete recent bot messages."""
     if chat_id in message_history:
         for msg_id in message_history[chat_id]:
             try:
@@ -445,17 +426,15 @@ def clear_chat(chat_id):
         message_history[chat_id].clear()
 
 def add_task(chat_id, task_text):
-    """Add a task with optional simplified due date."""
+    """Add a task with optional due date."""
     try:
         parts = task_text.split(',', 1)
         description = parts[0].strip()
         due_date = None
         now = datetime.now()
-        
         if len(parts) > 1:
             due_str = parts[1].strip().lower()
             try:
-                # Handle relative times
                 if re.match(r'in\s*\d+\s*minute(s)?', due_str):
                     minutes = int(re.search(r'\d+', due_str).group())
                     due_date = (now + timedelta(minutes=minutes)).replace(microsecond=0).isoformat()
@@ -472,7 +451,6 @@ def add_task(chat_id, task_text):
                     time_str = re.search(r'\d{1,2}:\d{2}', due_str).group()
                     due_date = datetime.strptime(f"{now.date() + timedelta(days=1)} {time_str}", "%Y-%m-%d %H:%M").replace(microsecond=0).isoformat()
                 else:
-                    # Try parsing as precise date (YYYY-MM-DD HH:MM)
                     due_date = datetime.strptime(due_str, "%Y-%m-%d %H:%M").replace(microsecond=0).isoformat()
                 logger.info(f"Parsed due date: {due_date}")
             except ValueError:
@@ -496,7 +474,7 @@ def add_task(chat_id, task_text):
         return f"Error adding task: {str(e)}"
 
 def view_tasks(chat_id):
-    """View all tasks for a user."""
+    """View all tasks."""
     if str(chat_id) not in tasks or not tasks[str(chat_id)]:
         return "No tasks found."
     
@@ -527,7 +505,7 @@ def delete_task(chat_id, index):
         return f"Error deleting task: {str(e)}"
 
 async def task_reminder_loop():
-    """Background task to check for due tasks and send Telegram reminders."""
+    """Background task for reminders."""
     logger.info("Starting task reminder loop")
     while True:
         try:
@@ -560,13 +538,13 @@ async def task_reminder_loop():
                                     logger.error(f"Unexpected error sending reminder to chat {chat_id}: {str(e)}")
                         except Exception as e:
                             logger.error(f"Error parsing due date for task {task['description']}: {str(e)}")
-            await asyncio.sleep(10)  # Check every 10 seconds
+            await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"Error in task reminder loop: {str(e)}")
             await asyncio.sleep(10)
 
 def send_long_message(bot, chat_id, reply_to_message_id, text, parse_mode):
-    """Split and send long messages to avoid Telegram's character limit."""
+    """Split and send long messages."""
     if not text:
         text = "No response available."
     chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
@@ -607,13 +585,13 @@ def send_long_message(bot, chat_id, reply_to_message_id, text, parse_mode):
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    """Handle the /start command and show the service menu."""
+    """Handle /start command."""
     user_states[message.chat.id] = None
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
     msg = bot.send_message(
         message.chat.id,
-        "Hi! Welcome to WordWave Bot , the ultimate Telegram Bot for language learning and intelligent interaction. Please Choose a Service:",
+        "Hi! Welcome to WordWave Bot.The ultimate Telegram Bot for language learning and intelligent interaction. Please Choose a Service:",
         reply_markup=get_main_keyboard()
     )
     message_history[message.chat.id].append(msg.message_id)
@@ -622,7 +600,7 @@ def welcome(message):
 
 @bot.message_handler(commands=['test_reminder'])
 def test_reminder(message):
-    """Send a test reminder to verify Telegram messaging."""
+    """Send a test reminder."""
     try:
         if message.chat.id not in message_history:
             message_history[message.chat.id] = []
@@ -645,7 +623,7 @@ def test_reminder(message):
 
 @bot.message_handler(func=lambda message: message.text == "Cambridge Dictionary")
 def prompt_dictionary(message):
-    """Prompt the user to enter a word for dictionary lookup."""
+    """Prompt for dictionary lookup."""
     user_states[message.chat.id] = "dictionary"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -660,7 +638,7 @@ def prompt_dictionary(message):
 
 @bot.message_handler(func=lambda message: message.text == "Convert Text to Speech")
 def prompt_text_to_speech(message):
-    """Prompt the user to enter text for speech conversion."""
+    """Prompt for text-to-speech."""
     user_states[message.chat.id] = "text_to_speech"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -675,7 +653,7 @@ def prompt_text_to_speech(message):
 
 @bot.message_handler(func=lambda message: message.text == "Ask a Question(GPT2)")
 def prompt_gpt2(message):
-    """Prompt the user to enter a question for GPT-2."""
+    """Prompt for GPT-2 question."""
     user_states[message.chat.id] = "gpt2"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -688,9 +666,9 @@ def prompt_gpt2(message):
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} selected GPT-2 question mode")
 
-@bot.message_handler(func=lambda message: message.text == "Translate to Persian")
+@bot.message_handler(func=lambda message: message.text == "Translate to Persian (Google Translate)")
 def prompt_translate_to_persian(message):
-    """Prompt the user to enter English text for translation to Persian."""
+    """Prompt for Persian translation."""
     user_states[message.chat.id] = "translate_to_persian"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -703,9 +681,9 @@ def prompt_translate_to_persian(message):
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} selected translate to Persian mode")
 
-@bot.message_handler(func=lambda message: message.text == "Translate to English")
+@bot.message_handler(func=lambda message: message.text == "Translate to English (Google Translate)")
 def prompt_translate_to_english(message):
-    """Prompt the user to enter Persian text for translation to English."""
+    """Prompt for English translation."""
     user_states[message.chat.id] = "translate_to_english"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -720,7 +698,7 @@ def prompt_translate_to_english(message):
 
 @bot.message_handler(func=lambda message: message.text == "To-Do List")
 def prompt_todo(message):
-    """Prompt the user to choose a to-do list action."""
+    """Prompt for to-do list action."""
     user_states[message.chat.id] = "todo"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -735,7 +713,7 @@ def prompt_todo(message):
 
 @bot.message_handler(func=lambda message: message.text == "Add Task")
 def prompt_add_task(message):
-    """Prompt the user to enter a task."""
+    """Prompt to add a task."""
     user_states[message.chat.id] = "add_task"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -750,7 +728,7 @@ def prompt_add_task(message):
 
 @bot.message_handler(func=lambda message: message.text == "View Tasks")
 def handle_view_tasks(message):
-    """Handle the view tasks action."""
+    """Handle view tasks action."""
     response = view_tasks(message.chat.id)
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -766,7 +744,7 @@ def handle_view_tasks(message):
 
 @bot.message_handler(func=lambda message: message.text == "Delete Task")
 def prompt_delete_task(message):
-    """Prompt the user to enter a task index to delete."""
+    """Prompt to delete a task."""
     user_states[message.chat.id] = "delete_task"
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -781,7 +759,7 @@ def prompt_delete_task(message):
 
 @bot.message_handler(func=lambda message: message.text == "Back to Main Menu")
 def back_to_main_menu(message):
-    """Return to the main menu."""
+    """Return to main menu."""
     user_states[message.chat.id] = None
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -796,7 +774,7 @@ def back_to_main_menu(message):
 
 @bot.message_handler(func=lambda message: message.text == "Clear Chat")
 def handle_clear_chat(message):
-    """Clear recent bot messages from the chat."""
+    """Clear recent bot messages."""
     clear_chat(message.chat.id)
     if message.chat.id not in message_history:
         message_history[message.chat.id] = []
@@ -809,9 +787,26 @@ def handle_clear_chat(message):
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} cleared chat")
 
+async def handle_async_input(message, state, text):
+    """Helper to handle async responses for translation."""
+    chat_id = message.chat.id
+    if state == "translate_to_persian":
+        if not text:
+            response = "Please provide English text to translate to Persian."
+        else:
+            response = await translate_to_persian(text)
+        return response, "MarkdownV2"
+    elif state == "translate_to_english":
+        if not text:
+            response = "Please provide Persian text to translate to English."
+        else:
+            response = await translate_to_english(text)
+        return response, "MarkdownV2"
+    return None, None
+
 @bot.message_handler(func=lambda message: True)
 def handle_input(message):
-    """Handle user input based on their selected mode."""
+    """Handle user input based on mode."""
     chat_id = message.chat.id
     state = user_states.get(chat_id, None)
     text = message.text.strip()
@@ -827,6 +822,28 @@ def handle_input(message):
         )
         message_history[chat_id].append(msg.message_id)
         message_history[chat_id] = message_history[chat_id][-10:]
+        return
+
+    if state in ["translate_to_persian", "translate_to_english"]:
+        # Handle async translation
+        try:
+            # Run async handler in the main loop
+            response, parse_mode = main_loop.run_until_complete(
+                handle_async_input(message, state, text)
+            )
+            send_long_message(bot, chat_id, message.id, response, parse_mode)
+        except Exception as e:
+            logger.error(f"Error handling async input: {str(e)}")
+            if chat_id not in message_history:
+                message_history[chat_id] = []
+            msg = bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message.id,
+                text=f"Error processing translation: {str(e)}",
+                reply_markup=get_main_keyboard()
+            )
+            message_history[chat_id].append(msg.message_id)
+            message_history[chat_id] = message_history[chat_id][-10:]
         return
 
     if state == "dictionary":
@@ -935,38 +952,6 @@ def handle_input(message):
         response = generate_gpt2_response(text)
         send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
 
-    elif state == "translate_to_persian":
-        if not text:
-            if chat_id not in message_history:
-                message_history[chat_id] = []
-            msg = bot.send_message(
-                chat_id=chat_id,
-                reply_to_message_id=message.id,
-                text="Please provide English text to translate to Persian.",
-                reply_markup=get_main_keyboard()
-            )
-            message_history[chat_id].append(msg.message_id)
-            message_history[chat_id] = message_history[chat_id][-10:]
-            return
-        response = translate_to_persian(text)
-        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
-
-    elif state == "translate_to_english":
-        if not text:
-            if chat_id not in message_history:
-                message_history[chat_id] = []
-            msg = bot.send_message(
-                chat_id=chat_id,
-                reply_to_message_id=message.id,
-                text="Please provide Persian text to translate to English.",
-                reply_markup=get_main_keyboard()
-            )
-            message_history[chat_id].append(msg.message_id)
-            message_history[chat_id] = message_history[chat_id][-10:]
-            return
-        response = translate_to_english(text)
-        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
-
     elif state == "add_task":
         if not text:
             if chat_id not in message_history:
@@ -1023,10 +1008,18 @@ def handle_input(message):
 if __name__ == "__main__":
     logger.info("Bot is running...")
     try:
-        # Start the task reminder loop in a separate thread
+        # Start the task reminder loop in a separate thread with its own event loop
         def run_reminder_loop():
-            asyncio.run(task_reminder_loop())
+            reminder_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(reminder_loop)
+            try:
+                reminder_loop.run_until_complete(task_reminder_loop())
+            finally:
+                reminder_loop.close()
         threading.Thread(target=run_reminder_loop, daemon=True).start()
         bot.infinity_polling(none_stop=True)
     except Exception as e:
         logger.error(f"Error in bot polling: {str(e)}")
+        # Ensure main event loop is closed gracefully
+        if not main_loop.is_closed():
+            main_loop.close()
