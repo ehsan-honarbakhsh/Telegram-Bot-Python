@@ -2,8 +2,6 @@
 Discover WordWave, the ultimate Telegram Bot for language learning and intelligent interaction! Packed with powerful features.
 WordWave Bot is a versatile Telegram bot designed to enhance productivity and language exploration with an intuitive, feature-rich experience. Powered by advanced technologies, WordWave offers a seamless blend of task management, language tools, and AI-driven insights, making it an essential companion for users seeking efficiency and knowledge on the go.
 
-# Key Features:
-
 # Task Management: 
 Create, view, and delete to-do lists with flexible reminders (e.g., "Buy groceries, in 2 hours"). Receive timely Telegram notifications to stay on track.
 Cambridge Dictionary Lookup: Access detailed word definitions, examples, and parts of speech from the Cambridge Dictionary, with a robust web-scraping fallback to ensure reliability even if the primary CLI tool encounters issues.
