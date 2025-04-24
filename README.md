@@ -1,10 +1,13 @@
 # Telegram-Bot-Python
-Discover our cutting-edge Telegram Bot, your ultimate companion for language learning and communication! Seamlessly blending innovation with practicality, this bot offers two powerful features:
+Discover WordWave, the ultimate Telegram Bot for language learning and intelligent interaction! Packed with powerful features, WordWave offers:
 
 # Cambridge Dictionary Lookup: 
-Instantly access precise definitions and real-world example sentences from the renowned Cambridge Dictionary. Whether you're a student, professional, or language enthusiast, enrich your vocabulary with reliable, up-to-date word insights at your fingertips.
-
+Access precise definitions and examples from the Cambridge Dictionary, ideal for vocabulary mastery.
 # Text-to-Speech Conversion: 
-Transform any text into natural, Australian-accented audio with Google Text-to-Speech technology. Perfect for accessibility, language practice, or on-the-go listening, this feature brings words to life with crystal-clear voice output.
+Transform text into natural, Australian-accented audio with Google Text-to-Speech, perfect for pronunciation and accessibility.
+# AI-Powered Question Answering: 
+Ask questions and receive answers generated locally with the free GPT-2 model from Hugging Face, no API costs required.
+# English/Persian to Persian/English Translation: 
+Translate English text to Persian instantly using Google Translate, enhancing cross-linguistic communication.
 
-With an intuitive interface featuring persistent, easy-to-use buttons, our bot ensures a smooth and engaging experience. Robust error handling, fast response times, and comprehensive logging make it a dependable tool for users worldwide. Elevate your learning and communication—try our Telegram Bot today and unlock a world of words and sounds!
+With a sleek, button-driven interface and robust error handling, WordWave ensures a seamless experience. Whether you’re studying, communicating, or exploring languages, WordWave is your go-to companion. Dive into the world of words and AI today!
