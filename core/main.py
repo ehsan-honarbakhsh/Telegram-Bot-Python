@@ -5,7 +5,6 @@ import requests
 import os
 import time
 import logging
-import asyncio
 import json
 import threading
 import html
@@ -13,7 +12,12 @@ from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 from gtts import gTTS
-
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from models.users import User
+from models.tasks import Task
+from models import Base
+import asyncio
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,6 +51,15 @@ if not API_TOKEN:
     raise ValueError("API_TOKEN environment variable not set")
 bot = telebot.TeleBot(API_TOKEN)
 
+# Initialize PostgreSQL database
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+logger.info("Database initialized")
+
 # Initialize GPT-2
 gpt2_generator = None
 if TRANSFORMERS_AVAILABLE:
@@ -71,56 +84,21 @@ if GOOGLETRANS_AVAILABLE:
 else:
     logger.error("Googletrans not available. Translation feature disabled.")
 
-# Global event loop for main thread
-main_loop = asyncio.get_event_loop()
-if main_loop.is_closed():
-    main_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(main_loop)
-logger.info("Main thread event loop initialized")
-
 # State management
 user_states = {}
 message_history = {}
-TASKS_FILE = "tasks.json"
-tasks = {}
-
-def load_tasks():
-    """Load tasks from JSON file."""
-    global tasks
-    try:
-        if os.path.exists(TASKS_FILE):
-            with open(TASKS_FILE, 'r') as f:
-                tasks = json.load(f)
-            logger.info("Tasks loaded from file")
-        else:
-            tasks = {}
-            logger.info("No tasks file found, starting with empty tasks")
-    except Exception as e:
-        logger.error(f"Failed to load tasks: {str(e)}")
-        tasks = {}
-
-def save_tasks():
-    """Save tasks to JSON file."""
-    try:
-        with open(TASKS_FILE, 'w') as f:
-            json.dump(tasks, f, indent=2)
-        logger.info("Tasks saved to file")
-    except Exception as e:
-        logger.error(f"Failed to save tasks: {str(e)}")
-
-load_tasks()
 
 def get_main_keyboard():
     """Create the main reply keyboard."""
     markup = ReplyKeyboardMarkup(resize_keyboard=True, input_field_placeholder="Choose a Service")
-    markup.add(KeyboardButton('Convert Text to Speech'))
+    markup.add(KeyboardButton('Convert Text to Sound'))
     markup.add(KeyboardButton('Cambridge Dictionary'))
     markup.add(KeyboardButton('To-Do List'))
     if gpt2_generator:
-        markup.add(KeyboardButton('Ask a Question(GPT2)'))
+        markup.add(KeyboardButton('Ask a Question'))
     if translator:
-        markup.add(KeyboardButton('Translate to Persian (Google Translate)'))
-        markup.add(KeyboardButton('Translate to English (Google Translate)'))
+        markup.add(KeyboardButton('Translate to Persian'))
+        markup.add(KeyboardButton('Translate to English'))
     markup.add(KeyboardButton('Clear Chat'))
     return markup
 
@@ -359,60 +337,235 @@ def generate_gpt2_response(question):
         logger.error(error_msg)
         return error_msg
 
-async def async_translate(text, src_lang, dest_lang):
-    """Helper function to perform asynchronous translation."""
-    try:
-        translation = await translator.translate(text, src=src_lang, dest=dest_lang)
-        return translation
-    except Exception as e:
-        logger.error(f"Async translation failed: {str(e)}")
-        raise
-
 async def translate_to_persian(text):
-    """Translate text from English to Persian."""
+    """Translate text from English to Persian (asynchronous)."""
     if not translator:
-        return "Error: Google Translate feature is unavailable due to missing dependencies."
+        return escape_markdown_v2("Error: Google Translate feature is unavailable due to missing dependencies.")
     if not text.strip():
-        return "Error: No text provided for translation."
+        return escape_markdown_v2("Error: No text provided for translation.")
     try:
         src_lang = 'en'
         dest_lang = 'fa'
         if src_lang not in LANGUAGES or dest_lang not in LANGUAGES:
-            return "Error: English ('en') or Persian ('fa') not supported."
-        translation = await async_translate(text, src_lang, dest_lang)
+            return escape_markdown_v2("Error: English ('en') or Persian ('fa') not supported.")
+        translation = await translator.translate(text, src=src_lang, dest=dest_lang)
         result = (
             f"English: {text}\n"
             f"Persian: {translation.text}"
         )
         logger.info(f"Translated '{text}' from English to Persian: {translation.text}")
-        return result
+        return escape_markdown_v2(result)
     except Exception as e:
         error_msg = f"Error translating text to Persian: {str(e)}"
         logger.error(error_msg)
-        return error_msg
+        return escape_markdown_v2(error_msg)
 
 async def translate_to_english(text):
-    """Translate text from Persian to English."""
+    """Translate text from Persian to English (asynchronous)."""
     if not translator:
-        return "Error: Google Translate feature is unavailable due to missing dependencies."
+        return escape_markdown_v2("Error: Google Translate feature is unavailable due to missing dependencies.")
     if not text.strip():
-        return "Error: No text provided for translation."
+        return escape_markdown_v2("Error: No text provided for translation.")
     try:
         src_lang = 'fa'
         dest_lang = 'en'
         if src_lang not in LANGUAGES or dest_lang not in LANGUAGES:
-            return "Error: Persian ('fa') or English ('en') not supported."
-        translation = await async_translate(text, src_lang, dest_lang)
+            return escape_markdown_v2("Error: Persian ('fa') or English ('en') not supported.")
+        translation = await translator.translate(text, src=src_lang, dest=dest_lang)
         result = (
             f"Persian: {text}\n"
             f"English: {translation.text}"
         )
         logger.info(f"Translated '{text}' from Persian to English: {translation.text}")
-        return result
+        return escape_markdown_v2(result)
     except Exception as e:
         error_msg = f"Error translating text to English: {str(e)}"
         logger.error(error_msg)
-        return error_msg
+        return escape_markdown_v2(error_msg)
+
+def manage_user(chat_id, username, first_name, last_name):
+    """Create or update a user in the database."""
+    session = Session()
+    try:
+        user = session.query(User).filter_by(chat_id=chat_id).first()
+        if user:
+            # Update existing user
+            user.username = username
+            user.first_name = first_name
+            user.last_name = last_name
+            logger.info(f"Updated user: chat_id={chat_id}, username={username}")
+        else:
+            # Create new user
+            user = User(
+                chat_id=chat_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name
+            )
+            session.add(user)
+            logger.info(f"Created new user: chat_id={chat_id}, username={username}")
+        session.commit()
+        return user
+    except Exception as e:
+        logger.error(f"Error managing user (chat_id={chat_id}): {str(e)}")
+        session.rollback()
+        return None
+    finally:
+        session.close()
+
+def add_task(chat_id, task_text):
+    """Add a task with optional due date to the database."""
+    session = Session()
+    try:
+        # Get or create user
+        user = session.query(User).filter_by(chat_id=chat_id).first()
+        if not user:
+            return "Error: User not found. Please use /start first."
+
+        # Parse task
+        parts = task_text.split(',', 1)
+        description = parts[0].strip()
+        due_date = None
+        now = datetime.now()
+        if len(parts) > 1:
+            due_str = parts[1].strip().lower()
+            try:
+                if re.match(r'in\s*\d+\s*minute(s)?', due_str):
+                    minutes = int(re.search(r'\d+', due_str).group())
+                    due_date = now + timedelta(minutes=minutes)
+                elif re.match(r'in\s*\d+\s*hour(s)?', due_str):
+                    hours = int(re.search(r'\d+', due_str).group())
+                    due_date = now + timedelta(hours=hours)
+                elif re.match(r'in\s*\d+\s*day(s)?', due_str):
+                    days = int(re.search(r'\d+', due_str).group())
+                    due_date = now + timedelta(days=days)
+                elif re.match(r'today\s*\d{1,2}:\d{2}', due_str):
+                    time_str = re.search(r'\d{1,2}:\d{2}', due_str).group()
+                    due_date = datetime.strptime(f"{now.date()} {time_str}", "%Y-%m-%d %H:%M")
+                elif re.match(r'tomorrow\s*\d{1,2}:\d{2}', due_str):
+                    time_str = re.search(r'\d{1,2}:\d{2}', due_str).group()
+                    due_date = datetime.strptime(f"{now.date() + timedelta(days=1)} {time_str}", "%Y-%m-%d %H:%M")
+                else:
+                    due_date = datetime.strptime(due_str, "%Y-%m-%d %H:%M")
+                logger.info(f"Parsed due date: {due_date}")
+            except ValueError:
+                return "Error: Invalid due date. Use 'in 2 hours', 'tomorrow 14:00', 'today 18:00', or 'YYYY-MM-DD HH:MM'."
+        
+        if not description:
+            return "Error: Task description cannot be empty."
+        
+        # Create task
+        task = Task(
+            user_id=user.id,
+            description=description,
+            due_date=due_date,
+            notified=False
+        )
+        session.add(task)
+        session.commit()
+        logger.info(f"Added task for chat {chat_id}: {description}")
+        response = f"Task added: {escape_markdown_v2(description)}" + (f" \\(Due: {escape_markdown_v2(due_date.isoformat())}\\)" if due_date else "")
+        return response
+    except Exception as e:
+        logger.error(f"Error adding task for chat {chat_id}: {str(e)}")
+        session.rollback()
+        return f"Error adding task: {str(e)}"
+    finally:
+        session.close()
+
+def view_tasks(chat_id):
+    """View all tasks for a user from the database."""
+    session = Session()
+    try:
+        user = session.query(User).filter_by(chat_id=chat_id).first()
+        if not user:
+            return "Error: User not found. Please use /start first."
+        
+        tasks = session.query(Task).filter_by(user_id=user.id).all()
+        if not tasks:
+            return "No tasks found."
+        
+        output = ["*Your Tasks*:"]
+        for i, task in enumerate(tasks, 1):
+            due = f" \\(Due: {escape_markdown_v2(task.due_date.isoformat())}\\)" if task.due_date else ""
+            output.append(f"{i}\\. {escape_markdown_v2(task.description)}{due}")
+        return "\n".join(output)
+    except Exception as e:
+        logger.error(f"Error viewing tasks for chat {chat_id}: {str(e)}")
+        return f"Error viewing tasks: {str(e)}"
+    finally:
+        session.close()
+
+def delete_task(chat_id, index):
+    """Delete a task by index from the database."""
+    session = Session()
+    try:
+        user = session.query(User).filter_by(chat_id=chat_id).first()
+        if not user:
+            return "Error: User not found. Please use /start first."
+        
+        tasks = session.query(Task).filter_by(user_id=user.id).all()
+        if not tasks:
+            return "No tasks to delete."
+        
+        try:
+            index = int(index) - 1
+            if 0 <= index < len(tasks):
+                task = tasks[index]
+                session.delete(task)
+                session.commit()
+                logger.info(f"Deleted task for chat {chat_id}: {task.description}")
+                return f"Deleted task: {escape_markdown_v2(task.description)}"
+            else:
+                return "Error: Invalid task index."
+        except ValueError:
+            return "Error: Please provide a valid number."
+    except Exception as e:
+        logger.error(f"Error deleting task for chat {chat_id}: {str(e)}")
+        session.rollback()
+        return f"Error deleting task: {str(e)}"
+    finally:
+        session.close()
+
+async def task_reminder_loop():
+    """Background task for reminders using the database."""
+    logger.info("Starting task reminder loop")
+    while True:
+        try:
+            now = datetime.now().replace(microsecond=0)
+            logger.info(f"Checking tasks at {now}")
+            session = Session()
+            try:
+                tasks = session.query(Task).filter(Task.due_date != None, Task.notified == False).all()
+                for task in tasks:
+                    if task.due_date and now >= task.due_date:
+                        try:
+                            user = session.query(User).filter_by(id=task.user_id).first()
+                            if user:
+                                msg = bot.send_message(
+                                    chat_id=user.chat_id,
+                                    text=f"Task due: {escape_markdown_v2(task.description)}",
+                                    parse_mode="MarkdownV2"
+                                )
+                                if user.chat_id not in message_history:
+                                    message_history[user.chat_id] = []
+                                message_history[user.chat_id].append(msg.message_id)
+                                message_history[user.chat_id] = message_history[user.chat_id][-10:]
+                                task.notified = True
+                                session.commit()
+                                logger.info(f"Sent Telegram reminder for task: {task.description} (chat {user.chat_id})")
+                        except telebot.apihelper.ApiTelegramException as e:
+                            logger.error(f"Failed to send reminder to chat {user.chat_id}: {str(e)}")
+                        except Exception as e:
+                            logger.error(f"Unexpected error sending reminder for task {task.description}: {str(e)}")
+            except Exception as e:
+                logger.error(f"Error querying tasks in reminder loop: {str(e)}")
+            finally:
+                session.close()
+            await asyncio.sleep(10)
+        except Exception as e:
+            logger.error(f"Error in task reminder loop: {str(e)}")
+            await asyncio.sleep(10)
 
 def clear_chat(chat_id):
     """Delete recent bot messages."""
@@ -424,124 +577,6 @@ def clear_chat(chat_id):
             except telebot.apihelper.ApiTelegramException as e:
                 logger.error(f"Failed to delete message {msg_id} in chat {chat_id}: {str(e)}")
         message_history[chat_id].clear()
-
-def add_task(chat_id, task_text):
-    """Add a task with optional due date."""
-    try:
-        parts = task_text.split(',', 1)
-        description = parts[0].strip()
-        due_date = None
-        now = datetime.now()
-        if len(parts) > 1:
-            due_str = parts[1].strip().lower()
-            try:
-                if re.match(r'in\s*\d+\s*minute(s)?', due_str):
-                    minutes = int(re.search(r'\d+', due_str).group())
-                    due_date = (now + timedelta(minutes=minutes)).replace(microsecond=0).isoformat()
-                elif re.match(r'in\s*\d+\s*hour(s)?', due_str):
-                    hours = int(re.search(r'\d+', due_str).group())
-                    due_date = (now + timedelta(hours=hours)).replace(microsecond=0).isoformat()
-                elif re.match(r'in\s*\d+\s*day(s)?', due_str):
-                    days = int(re.search(r'\d+', due_str).group())
-                    due_date = (now + timedelta(days=days)).replace(microsecond=0).isoformat()
-                elif re.match(r'today\s*\d{1,2}:\d{2}', due_str):
-                    time_str = re.search(r'\d{1,2}:\d{2}', due_str).group()
-                    due_date = datetime.strptime(f"{now.date()} {time_str}", "%Y-%m-%d %H:%M").replace(microsecond=0).isoformat()
-                elif re.match(r'tomorrow\s*\d{1,2}:\d{2}', due_str):
-                    time_str = re.search(r'\d{1,2}:\d{2}', due_str).group()
-                    due_date = datetime.strptime(f"{now.date() + timedelta(days=1)} {time_str}", "%Y-%m-%d %H:%M").replace(microsecond=0).isoformat()
-                else:
-                    due_date = datetime.strptime(due_str, "%Y-%m-%d %H:%M").replace(microsecond=0).isoformat()
-                logger.info(f"Parsed due date: {due_date}")
-            except ValueError:
-                return "Error: Invalid due date. Use 'in 2 hours', 'tomorrow 14:00', 'today 18:00', or 'YYYY-MM-DD HH:MM'."
-        
-        if not description:
-            return "Error: Task description cannot be empty."
-        
-        if str(chat_id) not in tasks:
-            tasks[str(chat_id)] = []
-        
-        task = {"description": description, "due_date": due_date, "notified": False}
-        tasks[str(chat_id)].append(task)
-        save_tasks()
-        logger.info(f"Added task for chat {chat_id}: {task}")
-        response = f"Task added: {escape_markdown_v2(description)}" + (f" \\(Due: {escape_markdown_v2(due_date)}\\)" if due_date else "")
-        logger.info(f"Task response: {response}")
-        return response
-    except Exception as e:
-        logger.error(f"Error adding task: {str(e)}")
-        return f"Error adding task: {str(e)}"
-
-def view_tasks(chat_id):
-    """View all tasks."""
-    if str(chat_id) not in tasks or not tasks[str(chat_id)]:
-        return "No tasks found."
-    
-    output = ["*Your Tasks*:"]
-    for i, task in enumerate(tasks[str(chat_id)], 1):
-        due = f" \\(Due: {escape_markdown_v2(task['due_date'])}\\)" if task.get('due_date') else ""
-        output.append(f"{i}\\. {escape_markdown_v2(task['description'])}{due}")
-    return "\n".join(output)
-
-def delete_task(chat_id, index):
-    """Delete a task by index."""
-    if str(chat_id) not in tasks or not tasks[str(chat_id)]:
-        return "No tasks to delete."
-    
-    try:
-        index = int(index) - 1
-        if 0 <= index < len(tasks[str(chat_id)]):
-            deleted_task = tasks[str(chat_id)].pop(index)
-            save_tasks()
-            logger.info(f"Deleted task for chat {chat_id}: {deleted_task}")
-            return f"Deleted task: {escape_markdown_v2(deleted_task['description'])}"
-        else:
-            return "Error: Invalid task index."
-    except ValueError:
-        return "Error: Please provide a valid number."
-    except Exception as e:
-        logger.error(f"Error deleting task: {str(e)}")
-        return f"Error deleting task: {str(e)}"
-
-async def task_reminder_loop():
-    """Background task for reminders."""
-    logger.info("Starting task reminder loop")
-    while True:
-        try:
-            now = datetime.now().replace(microsecond=0)
-            logger.info(f"Checking tasks at {now}")
-            for chat_id, user_tasks in tasks.items():
-                for task in user_tasks:
-                    due_date = task.get('due_date')
-                    if due_date:
-                        try:
-                            due = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
-                            logger.info(f"Checking task: {task['description']} (due: {due_date}, now: {now})")
-                            if now >= due and not task.get('notified'):
-                                try:
-                                    msg = bot.send_message(
-                                        chat_id=int(chat_id),
-                                        text=f"Task due: {escape_markdown_v2(task['description'])}",
-                                        parse_mode="MarkdownV2"
-                                    )
-                                    if int(chat_id) not in message_history:
-                                        message_history[int(chat_id)] = []
-                                    message_history[int(chat_id)].append(msg.message_id)
-                                    message_history[int(chat_id)] = message_history[int(chat_id)][-10:]
-                                    task['notified'] = True
-                                    save_tasks()
-                                    logger.info(f"Sent Telegram reminder for task: {task['description']} (chat {chat_id})")
-                                except telebot.apihelper.ApiTelegramException as e:
-                                    logger.error(f"Failed to send reminder to chat {chat_id}: {str(e)}")
-                                except Exception as e:
-                                    logger.error(f"Unexpected error sending reminder to chat {chat_id}: {str(e)}")
-                        except Exception as e:
-                            logger.error(f"Error parsing due date for task {task['description']}: {str(e)}")
-            await asyncio.sleep(10)
-        except Exception as e:
-            logger.error(f"Error in task reminder loop: {str(e)}")
-            await asyncio.sleep(10)
 
 def send_long_message(bot, chat_id, reply_to_message_id, text, parse_mode):
     """Split and send long messages."""
@@ -586,17 +621,33 @@ def send_long_message(bot, chat_id, reply_to_message_id, text, parse_mode):
 @bot.message_handler(commands=['start'])
 def welcome(message):
     """Handle /start command."""
-    user_states[message.chat.id] = None
-    if message.chat.id not in message_history:
-        message_history[message.chat.id] = []
+    chat_id = message.chat.id
+    user = message.from_user
+    user_states[chat_id] = None
+    if chat_id not in message_history:
+        message_history[chat_id] = []
+    
+    # Manage user in database
+    manage_user(
+        chat_id=chat_id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name
+    )
+    
+    # Escape the entire message for MarkdownV2
+    message_text = escape_markdown_v2(
+        f"Hi {user.first_name or 'User'}! Welcome to WordWave Bot. Choose a service:"
+    )
     msg = bot.send_message(
-        message.chat.id,
-        "Hi! Welcome to WordWave Bot.The ultimate Telegram Bot for language learning and intelligent interaction. Please Choose a Service:",
+        chat_id,
+        message_text,
+        parse_mode="MarkdownV2",
         reply_markup=get_main_keyboard()
     )
-    message_history[message.chat.id].append(msg.message_id)
-    message_history[message.chat.id] = message_history[message.chat.id][-10:]
-    logger.info("Welcome message sent")
+    message_history[chat_id].append(msg.message_id)
+    message_history[chat_id] = message_history[chat_id][-10:]
+    logger.info(f"Welcome message sent to chat_id={chat_id}")
 
 @bot.message_handler(commands=['test_reminder'])
 def test_reminder(message):
@@ -606,7 +657,7 @@ def test_reminder(message):
             message_history[message.chat.id] = []
         msg = bot.send_message(
             message.chat.id,
-            "Test reminder!",
+            escape_markdown_v2("Test reminder!"),
             parse_mode="MarkdownV2"
         )
         message_history[message.chat.id].append(msg.message_id)
@@ -636,7 +687,7 @@ def prompt_dictionary(message):
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} selected dictionary mode")
 
-@bot.message_handler(func=lambda message: message.text == "Convert Text to Speech")
+@bot.message_handler(func=lambda message: message.text == "Convert Text to Sound")
 def prompt_text_to_speech(message):
     """Prompt for text-to-speech."""
     user_states[message.chat.id] = "text_to_speech"
@@ -651,7 +702,7 @@ def prompt_text_to_speech(message):
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} selected text-to-speech mode")
 
-@bot.message_handler(func=lambda message: message.text == "Ask a Question(GPT2)")
+@bot.message_handler(func=lambda message: message.text == "Ask a Question")
 def prompt_gpt2(message):
     """Prompt for GPT-2 question."""
     user_states[message.chat.id] = "gpt2"
@@ -659,14 +710,15 @@ def prompt_gpt2(message):
         message_history[message.chat.id] = []
     msg = bot.send_message(
         message.chat.id,
-        "Please ask a question, and I'll answer using GPT-2!",
+        escape_markdown_v2("Please ask a question, and I'll answer using GPT-2!"),
+        parse_mode="MarkdownV2",
         reply_markup=get_main_keyboard()
     )
     message_history[message.chat.id].append(msg.message_id)
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} selected GPT-2 question mode")
 
-@bot.message_handler(func=lambda message: message.text == "Translate to Persian (Google Translate)")
+@bot.message_handler(func=lambda message: message.text == "Translate to Persian")
 def prompt_translate_to_persian(message):
     """Prompt for Persian translation."""
     user_states[message.chat.id] = "translate_to_persian"
@@ -681,7 +733,7 @@ def prompt_translate_to_persian(message):
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} selected translate to Persian mode")
 
-@bot.message_handler(func=lambda message: message.text == "Translate to English (Google Translate)")
+@bot.message_handler(func=lambda message: message.text == "Translate to English")
 def prompt_translate_to_english(message):
     """Prompt for English translation."""
     user_states[message.chat.id] = "translate_to_english"
@@ -780,29 +832,13 @@ def handle_clear_chat(message):
         message_history[message.chat.id] = []
     msg = bot.send_message(
         message.chat.id,
-        "Chat cleared!",
+        escape_markdown_v2("Chat cleared!"),
+        parse_mode="MarkdownV2",
         reply_markup=get_main_keyboard()
     )
     message_history[message.chat.id].append(msg.message_id)
     message_history[message.chat.id] = message_history[message.chat.id][-10:]
     logger.info(f"User {message.chat.id} cleared chat")
-
-async def handle_async_input(message, state, text):
-    """Helper to handle async responses for translation."""
-    chat_id = message.chat.id
-    if state == "translate_to_persian":
-        if not text:
-            response = "Please provide English text to translate to Persian."
-        else:
-            response = await translate_to_persian(text)
-        return response, "MarkdownV2"
-    elif state == "translate_to_english":
-        if not text:
-            response = "Please provide Persian text to translate to English."
-        else:
-            response = await translate_to_english(text)
-        return response, "MarkdownV2"
-    return None, None
 
 @bot.message_handler(func=lambda message: True)
 def handle_input(message):
@@ -822,28 +858,6 @@ def handle_input(message):
         )
         message_history[chat_id].append(msg.message_id)
         message_history[chat_id] = message_history[chat_id][-10:]
-        return
-
-    if state in ["translate_to_persian", "translate_to_english"]:
-        # Handle async translation
-        try:
-            # Run async handler in the main loop
-            response, parse_mode = main_loop.run_until_complete(
-                handle_async_input(message, state, text)
-            )
-            send_long_message(bot, chat_id, message.id, response, parse_mode)
-        except Exception as e:
-            logger.error(f"Error handling async input: {str(e)}")
-            if chat_id not in message_history:
-                message_history[chat_id] = []
-            msg = bot.send_message(
-                chat_id=chat_id,
-                reply_to_message_id=message.id,
-                text=f"Error processing translation: {str(e)}",
-                reply_markup=get_main_keyboard()
-            )
-            message_history[chat_id].append(msg.message_id)
-            message_history[chat_id] = message_history[chat_id][-10:]
         return
 
     if state == "dictionary":
@@ -952,6 +966,38 @@ def handle_input(message):
         response = generate_gpt2_response(text)
         send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
 
+    elif state == "translate_to_persian":
+        if not text:
+            if chat_id not in message_history:
+                message_history[chat_id] = []
+            msg = bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message.id,
+                text="Please provide English text to translate to Persian.",
+                reply_markup=get_main_keyboard()
+            )
+            message_history[chat_id].append(msg.message_id)
+            message_history[chat_id] = message_history[chat_id][-10:]
+            return
+        response = asyncio.run(translate_to_persian(text))
+        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
+
+    elif state == "translate_to_english":
+        if not text:
+            if chat_id not in message_history:
+                message_history[chat_id] = []
+            msg = bot.send_message(
+                chat_id=chat_id,
+                reply_to_message_id=message.id,
+                text="Please provide Persian text to translate to English.",
+                reply_markup=get_main_keyboard()
+            )
+            message_history[chat_id].append(msg.message_id)
+            message_history[chat_id] = message_history[chat_id][-10:]
+            return
+        response = asyncio.run(translate_to_english(text))
+        send_long_message(bot, chat_id, message.id, response, "MarkdownV2")
+
     elif state == "add_task":
         if not text:
             if chat_id not in message_history:
@@ -1008,18 +1054,16 @@ def handle_input(message):
 if __name__ == "__main__":
     logger.info("Bot is running...")
     try:
-        # Start the task reminder loop in a separate thread with its own event loop
+        # Start the task reminder loop in a separate thread
         def run_reminder_loop():
-            reminder_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(reminder_loop)
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             try:
-                reminder_loop.run_until_complete(task_reminder_loop())
+                loop.run_until_complete(task_reminder_loop())
             finally:
-                reminder_loop.close()
+                loop.close()
         threading.Thread(target=run_reminder_loop, daemon=True).start()
         bot.infinity_polling(none_stop=True)
     except Exception as e:
         logger.error(f"Error in bot polling: {str(e)}")
-        # Ensure main event loop is closed gracefully
-        if not main_loop.is_closed():
-            main_loop.close()
